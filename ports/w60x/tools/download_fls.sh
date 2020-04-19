@@ -3,7 +3,7 @@
 #SERIAL_NAME=ttyUSB3
 #SERIAL_NAME=tty.usbserial3
 #you can use "wm_tool -l" to view the locally available serial port number.
-SERIAL_NAME=
+SERIAL_NAME=ttyUSB0
 
 TARGET=wm_w600
 _ENV_TARGET=""
@@ -57,7 +57,7 @@ main()
     fi
 
 #	./${DLIMG} -c ${SERIAL_NAME} -ds 2M -dl "${BUILD}/${TARGET}.fls" -eo all -ws 115200 -rs at
-	./${DLIMG} -c ${SERIAL_NAME} -ds 2M -dl "${BUILD}/${TARGET}.fls" -eo all -rs rts
+	./${DLIMG} -c ${SERIAL_NAME} -ds 2M -dl "${BUILD}/${TARGET}.fls" -eo secboot -rs rts
 }
 
 usage()
