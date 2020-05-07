@@ -156,25 +156,49 @@ int build_full_path(struct ftp_session *session, char *path, char *new_path, siz
         if ((strlen(path) + 1) > size) {  // check, if the buffer fits
             return -1;
         }
-        strcpy(new_path, path);
+        sprintf(new_path, "%s/", path); // Excess slash will be removed later
     } else {
         if ((strlen(session->currentdir) + strlen(path) + 2) > size) {  // check, if the buffer fits
             return -1;
         }
-        if (session->currentdir[strlen(session->currentdir) - 1] == '/') { // CWD ends in '/'?
-            sprintf(new_path, "%s%s", session->currentdir, path);  // Yes: do not add '/'
-        } else {
-            sprintf(new_path, "%s/%s", session->currentdir, path); // No: add '/'
+        sprintf(new_path, "%s/%s/", session->currentdir, path); // Excess slashes will be removed later
+    }
+    // Normalize path
+    if (strlen(new_path) != 1) {
+        size_t to = 1; 
+        size_t from = 1;
+        size_t len = strlen(new_path);
+        while (from < len) {
+            for (; new_path[from] == '/' && from < len; from ++) ; // scan for the start
+            if (from > to) { // more than one /, squeeze it out
+                memmove(new_path + to, new_path + from, len - from + 1);
+                len -= (from - to);
+                from = to;
+            }
+            for (; new_path[from] != '/' && from < len; from++) ; // scan for the next /
+            if ((from - to) == 1 && new_path[to] == '.') { // './', ignore
+                from++;
+                memmove(new_path + to, new_path + from, len - from + 1);
+                len -= 2;
+                from = to;
+            } else if ((from - to) == 2 && new_path[to] == '.' && new_path[to + 1] == '.') { // '../', skip back
+                if (to > 1) { // do not skip back at the tip
+                    for (--to; to > 1 && new_path[to - 1] != '/'; to--) ; // skip back
+                }
+                from++;
+                memmove(new_path + to, new_path + from, len - from + 1);
+                len -= (from - to);
+                from = to;
+            } else { // normal element, keep it and just align the offsets
+                to = ++from;
+            }
+        }
+        if (len > 1 && new_path[len - 1] == '/') {
+            new_path[len - 1] = '\0'; // drop trailing '/'
         }
     }
-
-    if ((strlen(new_path) > 1) && new_path[strlen(new_path) - 1] == '/')
-        new_path[strlen(new_path) - 1] = '\0'; // drop trailing '/'
-
     return 0;
 }
-
-
 
 static void w600_ftps_task(void *param) {
     int numbytes;
@@ -408,16 +432,20 @@ int ftp_process_request(struct ftp_session *session, char *buf) {
 
     /* get request parameter */
     parameter_ptr = strchr(buf, ' ');
-    while (*parameter_ptr == ' ' && *parameter_ptr != '\0') {
-        parameter_ptr++;
-    }
-    // Build a path name by default, in case it is needed later.
-    if (build_full_path(session, parameter_ptr, filename, FTP_PATH_SIZE) != 0) {
+    if (parameter_ptr) {
+        while (*parameter_ptr == ' ' && *parameter_ptr != '\0') {
+            parameter_ptr++;
+        }
+        // Build a path name by default, in case it is needed later.
+        if (*parameter_ptr) {
+            if (build_full_path(session, parameter_ptr, filename, FTP_PATH_SIZE) != 0) {
 err_filename:        
-        sprintf(sbuf, "553 File name too long\r\n");
-        send(session->sockfd, sbuf, strlen(sbuf), 0);
-        tls_mem_free(sbuf);
-        return 0;
+                sprintf(sbuf, "553 File name too long\r\n");
+                send(session->sockfd, sbuf, strlen(sbuf), 0);
+                tls_mem_free(sbuf);
+                return 0;
+            }
+        }
     }
 
     // debug:
