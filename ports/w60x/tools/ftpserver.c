@@ -26,13 +26,15 @@ extern "C" {
 #include "mp_vfs_lfs.h"
 #endif
 
-//#define FTPS_DBG printf
+// #define FTPS_DBG printf("%ld: ", mp_hal_ticks_us());printf
 #define FTPS_DBG(...)
 
 #define FTP_SRV_ROOT        "/"
 #define FTP_MAX_CONNECTION  2
 #define FTP_WELCOME_MSG     "220-= welcome on W600 FTP server =-\r\n220 \r\n"
 #define FTP_BUFFER_SIZE     512
+#define FTP_PATH_SIZE       256
+#define FTP_LINE_SIZE       256
 
 struct ftp_session {
     bool is_anonymous;
@@ -48,8 +50,8 @@ struct ftp_session {
     size_t offset;
 
     /* current directory */
-    char currentdir[256];
-    char rename[256];
+    char currentdir[FTP_PATH_SIZE];
+    char rename[FTP_PATH_SIZE];
 
     struct netif *netif;
     int pasv_acpt_sockfd;
@@ -123,22 +125,42 @@ int ftp_get_filesize(char *filename) {
 #endif
 }
 
-bool is_absolute_path(char *path) {
-#ifdef _WIN32
-    if (path[0] == '\\' ||
-            (path[1] == ':' && path[2] == '\\'))
-        return TRUE;
-#else
-    if (path[0] == '/') return TRUE;
-#endif
+bool is_dir(char *directory) {
 
-    return FALSE;
+    if (strcmp(directory, FTP_SRV_ROOT) == 0) {  // root dir is one
+        return true;
+    }
+    
+    fs_user_mount_t *vfs_fs = spi_fls_vfs;
+#if MICROPY_VFS_FAT
+    FF_DIR dir;
+    FRESULT res = f_opendir (&vfs_fs->fatfs, &dir, directory);
+    if (res == FR_OK) {
+        f_closedir(&dir);
+        return true;
+    }
+#endif
+#if MICROPY_VFS_LFS2
+    lfs2_dir_t dir;
+    int res = lfs2_dir_open(&vfs_fs->lfs, &dir, directory);
+    if (res == LFS2_ERR_OK) {
+        lfs2_dir_close(&vfs_fs->lfs, &dir);
+        return true;
+    }
+#endif
+    return false;
 }
 
 int build_full_path(struct ftp_session *session, char *path, char *new_path, size_t size) {
-    if (is_absolute_path(path) == TRUE) {
+    if (*path == '/') {
+        if ((strlen(path) + 1) > size) {  // check, if the buffer fits
+            return -1;
+        }
         strcpy(new_path, path);
     } else {
+        if ((strlen(session->currentdir) + strlen(path) + 2) > size) {  // check, if the buffer fits
+            return -1;
+        }
         if (session->currentdir[strlen(session->currentdir) - 1] == '/') { // CWD ends in '/'?
             sprintf(new_path, "%s%s", session->currentdir, path);  // Yes: do not add '/'
         } else {
@@ -146,11 +168,13 @@ int build_full_path(struct ftp_session *session, char *path, char *new_path, siz
         }
     }
 
-    if ((strlen(new_path) > 2) && new_path[strlen(new_path) - 1] == '/')
+    if ((strlen(new_path) > 1) && new_path[strlen(new_path) - 1] == '/')
         new_path[strlen(new_path) - 1] = '\0'; // drop trailing '/'
 
     return 0;
 }
+
+
 
 static void w600_ftps_task(void *param) {
     int numbytes;
@@ -224,10 +248,6 @@ static void w600_ftps_task(void *param) {
                 /* new session */
                 session = ftp_new_session();
                 if (session != NULL) {
-#if MICROPY_VFS_FAT
-                    fs_user_mount_t *vfs_fs = spi_fls_vfs;
-                    f_chdir (&vfs_fs->fatfs, "/");
-#endif
                     strcpy(session->currentdir, FTP_SRV_ROOT);
                     session->offset = 0; // Initialize offset
                     session->sockfd = com_socket;
@@ -271,22 +291,6 @@ static void w600_ftps_task(void *param) {
             }
         }
     }
-
-#if 0
-    struct ftp_session *next;
-    session = session_list;
-    while (session != NULL) {
-        next = session->next;
-        if (-1 != session->sockfd)
-            closesocket(session->sockfd);
-        if (-1 != session->pasv_sockfd)
-            closesocket(session->pasv_sockfd);
-        tls_mem_free(session);
-        session = next;
-    }
-    closesocket(sockfd);
-    tls_mem_free(buffer);
-#endif
 }
 
 void w600_ftps_start(int port, char *user, char *pass) {
@@ -303,13 +307,8 @@ void w600_ftps_start(int port, char *user, char *pass) {
     is_run = 1;
 }
 
-int do_list(char *directory, int sockfd) {
-    char line_buffer[256], line_length;
-#ifdef _WIN32
-    //struct _stat s;
-#else
-    //struct stat s;
-#endif
+int do_list(char *directory, int sockfd, char *line_buffer, bool full_dir) {
+    int line_length;
 
     fs_user_mount_t *vfs_fs = spi_fls_vfs;
 #if MICROPY_VFS_FAT
@@ -331,96 +330,32 @@ int do_list(char *directory, int sockfd) {
         return -1;
     }
 
-    while (1) {
 #if MICROPY_VFS_FAT
+    while (1) {
         res = f_readdir (&dir, &fno);
         if ((res != FR_OK) || (fno.fname[0] == 0))
             break;
-#endif
-#if MICROPY_VFS_LFS2
-        res = lfs2_dir_read(&vfs_fs->lfs, &dir, &fno);
-
-        if (res <= 0)
-            break;
-#endif
-
-        //sprintf(line_buffer, "%s/%s", directory, fno.fname);
-#ifdef _WIN32
-        //if (_stat(line_buffer, &s) ==0)
-#else
-        //if (stat(line_buffer, &s) == 0)
-#endif
-        //{
-#if MICROPY_VFS_FAT
-        line_length = sprintf(line_buffer, "%srwxrwxrwx %3d root root %6d Jan 1 2018 %s\r\n", (fno.fattrib & AM_DIR) ? "d" : "-", 0, fno.fsize, fno.fname);
-#endif
-#if MICROPY_VFS_LFS2
-        line_length = sprintf(line_buffer, "%srwxrwxrwx %3d root root %6d Jan 1 2018 %s\r\n", (fno.type & LFS2_TYPE_DIR) ? "d" : "-", 0, fno.size, fno.name);
-#endif
-
+        if (full_dir) {
+            line_length = sprintf(line_buffer, "%srwxrwxrwx %3d root root %6d Jan 1 2018 %s\r\n", (fno.fattrib & AM_DIR) ? "d" : "-", 0, fno.fsize, fno.fname);
+        } else {
+            line_length = sprintf(line_buffer, "%s\r\n", fno.fname);
+        }
         send(sockfd, line_buffer, line_length, 0);
-        //}
-        //else
-        //{
-        //  FTPS_DBG("Get directory entry error\n");
-        //  break;
-        //}
     }
-
-#if MICROPY_VFS_FAT
-    f_closedir(&dir);
 #endif
 #if MICROPY_VFS_LFS2
-    lfs2_dir_close(&vfs_fs->lfs, &dir);
-#endif
-
-    return 0;
-}
-
-int do_simple_list(char *directory, int sockfd) {
-    char line_buffer[256], line_length;
-
-    fs_user_mount_t *vfs_fs = spi_fls_vfs;
-#if MICROPY_VFS_FAT
-    FF_DIR dir;
-    FILINFO fno;
-    FRESULT res = f_opendir (&vfs_fs->fatfs, &dir, directory);
-
-    if (res != FR_OK) {
-#endif
-#if MICROPY_VFS_LFS2
-    lfs2_dir_t dir;
-    struct lfs2_info fno;
-    int res = lfs2_dir_open(&vfs_fs->lfs, &dir, directory);
-
-    if (res != LFS2_ERR_OK) {
-#endif
-        line_length = sprintf(line_buffer, "500 Internal Error\r\n");
-        send(sockfd, line_buffer, line_length, 0);
-        return -1;
-    }
-
     while (1) {
-#if MICROPY_VFS_FAT
-        res = f_readdir (&dir, &fno);
-        if ((res != FR_OK) || (fno.fname[0] == 0))
-            break;
-#endif
-#if MICROPY_VFS_LFS2
         res = lfs2_dir_read(&vfs_fs->lfs, &dir, &fno);
         if (res <= 0)
             break;
-#endif
-
-#if MICROPY_VFS_FAT
-        line_length = sprintf(line_buffer, "%s\r\n", fno.fname);
-#endif
-#if MICROPY_VFS_LFS2
-        line_length = sprintf(line_buffer, "%s\r\n", fno.name);
-#endif
-
+        if (full_dir) {
+            line_length = sprintf(line_buffer, "%srwxrwxrwx %3d root root %6d Jan 1 2018 %s\r\n", (fno.type & LFS2_TYPE_DIR) ? "d" : "-", 0, fno.size, fno.name);
+        } else {
+            line_length = sprintf(line_buffer, "%s\r\n", fno.name);
+        }
         send(sockfd, line_buffer, line_length, 0);
     }
+#endif
 
 #if MICROPY_VFS_FAT
     f_closedir(&dir);
@@ -445,60 +380,10 @@ int str_begin_with(char *src, char *match) {
     return 0;
 }
 
-int ftp_get_pasv_sock(struct ftp_session *session) {
-#if 0
-    struct timeval tv;
-    fd_set readfds;
-    char *sbuf;
-    u32 addr_len = sizeof(struct sockaddr_in);
-    struct sockaddr_in local, pasvremote;
-
-    if (!session->pasv_active)
-        return 0;
-
-    sbuf = (char *)tls_mem_alloc(FTP_BUFFER_SIZE);
-    if (sbuf == NULL) {
-        return -1;
-    }
-
-    tv.tv_sec = 3, tv.tv_usec = 0;
-    FD_ZERO(&readfds);
-    FD_SET(session->pasv_acpt_sockfd, &readfds);
-    FTPS_DBG("Listening %d seconds @ port %d\n", tv.tv_sec, session->pasv_port);
-    select(session->pasv_acpt_sockfd + 1, &readfds, 0, 0, &tv);
-    if (FD_ISSET(session->pasv_acpt_sockfd, &readfds)) {
-        if ((session->pasv_sockfd = accept(session->pasv_acpt_sockfd, (struct sockaddr *)&pasvremote, &addr_len)) == -1) {
-            sprintf(sbuf, "425 Can't open data connection %d.\r\n", __LINE__);
-            send(session->sockfd, sbuf, strlen(sbuf), 0);
-            goto err1;
-        } else {
-            FTPS_DBG("Got Data(PASV) connection from %s\n", inet_ntoa(pasvremote.sin_addr));
-            session->pasv_active = 1;
-            closesocket(session->pasv_acpt_sockfd);
-            session->pasv_acpt_sockfd = -1;
-        }
-    } else {
-err1:
-        if (-1 != session->pasv_acpt_sockfd) {
-            closesocket(session->pasv_acpt_sockfd);
-            session->pasv_acpt_sockfd = -1;
-        }
-        if (-1 != session->pasv_sockfd) {
-            closesocket(session->pasv_sockfd);
-            session->pasv_sockfd = -1;
-        }
-        session->pasv_active = 0;
-
-    }
-    tls_mem_free(sbuf);
-#endif
-    return 0;
-}
-
 int ftp_process_request(struct ftp_session *session, char *buf) {
     struct timeval tv;
     fd_set readfds;
-    char filename[256];
+    char filename[FTP_PATH_SIZE];
     int  numbytes;
     char *sbuf;
     char *parameter_ptr, *ptr;
@@ -517,13 +402,23 @@ int ftp_process_request(struct ftp_session *session, char *buf) {
     /* remove \r\n */
     ptr = buf;
     while (*ptr) {
-        if (*ptr == '\r' || *ptr == '\n') *ptr = 0;
+        if (*ptr == '\r' || *ptr == '\n') *ptr = '\0';
         ptr ++;
     }
 
     /* get request parameter */
     parameter_ptr = strchr(buf, ' ');
-    if (parameter_ptr != NULL) parameter_ptr ++;
+    while (*parameter_ptr == ' ' && *parameter_ptr != '\0') {
+        parameter_ptr++;
+    }
+    // Build a path name by default, in case it is needed later.
+    if (build_full_path(session, parameter_ptr, filename, FTP_PATH_SIZE) != 0) {
+err_filename:        
+        sprintf(sbuf, "553 File name too long\r\n");
+        send(session->sockfd, sbuf, strlen(sbuf), 0);
+        tls_mem_free(sbuf);
+        return 0;
+    }
 
     // debug:
     FTPS_DBG("%s requested: \"%s\"\n", inet_ntoa(session->remote.sin_addr), buf);
@@ -570,8 +465,7 @@ int ftp_process_request(struct ftp_session *session, char *buf) {
         memset(sbuf, 0, FTP_BUFFER_SIZE);
         sprintf(sbuf, "150 Opening Binary mode connection for file list.\r\n");
         send(session->sockfd, sbuf, strlen(sbuf), 0);
-        ftp_get_pasv_sock(session);
-        do_list(session->currentdir, session->pasv_sockfd);
+        do_list(session->currentdir, session->pasv_sockfd, sbuf, true);
         closesocket(session->pasv_sockfd);
         session->pasv_sockfd = -1;
         session->pasv_active = 0;
@@ -581,8 +475,7 @@ int ftp_process_request(struct ftp_session *session, char *buf) {
         memset(sbuf, 0, FTP_BUFFER_SIZE);
         sprintf(sbuf, "150 Opening Binary mode connection for file list.\r\n");
         send(session->sockfd, sbuf, strlen(sbuf), 0);
-        ftp_get_pasv_sock(session);
-        do_simple_list(session->currentdir, session->pasv_sockfd);
+        do_list(session->currentdir, session->pasv_sockfd, sbuf, false);
         closesocket(session->pasv_sockfd);
         session->pasv_sockfd = -1;
         session->pasv_active = 0;
@@ -650,10 +543,6 @@ int ftp_process_request(struct ftp_session *session, char *buf) {
             closesocket(session->pasv_acpt_sockfd);
         session->pasv_acpt_sockfd = sockfd;
 
-#if 0
-        tls_mem_free(sbuf);
-        return 0;
-#else
         FD_ZERO(&readfds);
         FD_SET(sockfd, &readfds);
         FTPS_DBG("Listening %d seconds @ port %d\n", tv.tv_sec, session->pasv_port);
@@ -668,9 +557,7 @@ int ftp_process_request(struct ftp_session *session, char *buf) {
                 session->pasv_active = 1;
                 closesocket(sockfd);
             }
-        } else
-#endif
-        {
+        } else {
 err1:
             if (-1 != sockfd)
                 closesocket(sockfd);
@@ -684,10 +571,6 @@ err1:
         }
     } else if (str_begin_with(buf, "RETR") == 0) {
         int file_size;
-
-        strcpy(filename, buf + 5);
-
-        build_full_path(session, parameter_ptr, filename, 256);
         file_size = ftp_get_filesize(filename);
         if (file_size == -1) {
             sprintf(sbuf, "550 \"%s\" : not a regular file\r\n", filename);
@@ -758,9 +641,6 @@ err1:
             tls_mem_free(sbuf);
             return 0;
         }
-
-        build_full_path(session, parameter_ptr, filename, 256);
-
         fs_user_mount_t *vfs_fs = spi_fls_vfs;
 #if MICROPY_VFS_FAT
         FIL fp;
@@ -823,9 +703,6 @@ err1:
         session->pasv_sockfd = -1;
     } else if (str_begin_with(buf, "SIZE") == 0) {
         int file_size;
-
-        build_full_path(session, parameter_ptr, filename, 256);
-
         file_size = ftp_get_filesize(filename);
         if (file_size == -1) {
             sprintf(sbuf, "550 \"%s\" : not a regular file\r\n", filename);
@@ -841,27 +718,22 @@ err1:
         sprintf(sbuf, "215 %s\r\n", "UNIX system type: W600 FreeRTOS");
         send(session->sockfd, sbuf, strlen(sbuf), 0);
     } else if (str_begin_with(buf, "CWD") == 0) {
-        build_full_path(session, parameter_ptr, filename, 256);
-
-#if MICROPY_VFS_FAT
-        fs_user_mount_t *vfs_fs = spi_fls_vfs;
-        FRESULT res = f_chdir (&vfs_fs->fatfs, filename);
-        if (FR_OK != res) {
-            sprintf(sbuf, "550 \"%s\" : No such file or directory.\r\n", filename);
-        } else 
-#endif
-        {
-            sprintf(sbuf, "250 Changed to directory \"%s\"\r\n", filename);
+        // Test for path existence by using filesize, which in turn calls stat()
+        if (is_dir(filename)) {
             strcpy(session->currentdir, filename);
+            sprintf(sbuf, "250 Changed to directory \"%s\"\r\n", filename);
+        } else {
+            sprintf(sbuf, "550 Directory \"%s\" does not exist\r\n", filename);
         }
         send(session->sockfd, sbuf, strlen(sbuf), 0);
         FTPS_DBG("Changed to directory %s", filename);
     } else if (str_begin_with(buf, "CDUP") == 0) {
-        sprintf(filename, "%s/%s", session->currentdir, "..");
-
+        if (build_full_path(session, "..", filename, FTP_PATH_SIZE) != 0) {
+            goto err_filename;
+        }
+        strcpy(session->currentdir, filename);
         sprintf(sbuf, "250 Changed to directory \"%s\"\r\n", filename);
         send(session->sockfd, sbuf, strlen(sbuf), 0);
-        strcpy(session->currentdir, filename);
         FTPS_DBG("Changed to directory %s", filename);
     } else if (str_begin_with(buf, "PORT") == 0) {
         int i;
@@ -921,9 +793,6 @@ err1:
             tls_mem_free(sbuf);
             return 0;
         }
-
-        build_full_path(session, parameter_ptr, filename, 256);
-
         fs_user_mount_t *vfs_fs = spi_fls_vfs;
 #if MICROPY_VFS_FAT
         FRESULT res = f_mkdir (&vfs_fs->fatfs, filename);
@@ -948,9 +817,6 @@ err1:
             tls_mem_free(sbuf);
             return 0;
         }
-
-        build_full_path(session, parameter_ptr, filename, 256);
-
         fs_user_mount_t *vfs_fs = spi_fls_vfs;
 #if MICROPY_VFS_FAT
         FRESULT res = f_unlink (&vfs_fs->fatfs, filename);
@@ -967,7 +833,7 @@ err1:
 #endif
             sprintf(sbuf, "250 Successfully deleted file \"%s\".\r\n", filename);
         } else {
-            sprintf(sbuf, "550 Not such file or directory: %s.\r\n", filename);
+            sprintf(sbuf, "550 No such file or directory: %s.\r\n", filename);
         }
         send(session->sockfd, sbuf, strlen(sbuf), 0);
     } else if (str_begin_with(buf, "RMD") == 0) {
@@ -977,8 +843,6 @@ err1:
             tls_mem_free(sbuf);
             return 0;
         }
-        build_full_path(session, parameter_ptr, filename, 256);
-
         fs_user_mount_t *vfs_fs = spi_fls_vfs;
 #if MICROPY_VFS_FAT
         FILINFO fno;
@@ -1007,18 +871,17 @@ err1:
             tls_mem_free(sbuf);
             return 0;
         }
-
-        strcpy(session->rename, buf + 5);
+        strcpy(session->rename, filename);
         sprintf(sbuf, "350 Requested file action pending further information.\r\n");
         send(session->sockfd, sbuf, strlen(sbuf), 0);
     } else if (str_begin_with(buf, "RNTO") == 0) {
         fs_user_mount_t *vfs_fs = spi_fls_vfs;
 #if MICROPY_VFS_FAT
-        FRESULT res = f_rename (&vfs_fs->fatfs, session->rename, buf + 5);
+        FRESULT res = f_rename (&vfs_fs->fatfs, session->rename, filename);
         if (res != FR_OK) {
 #endif
 #if MICROPY_VFS_LFS2
-        int res = lfs2_rename(&vfs_fs->lfs, session->rename, buf + 5);
+        int res = lfs2_rename(&vfs_fs->lfs, session->rename, filename);
         if (res == LFS2_ERR_NOTEMPTY) {
             printf("Dir is not empty\r\n");
         }
